@@ -1,31 +1,21 @@
 import folium
 import streamlit as st
 
-from operator import itemgetter
-from folium.plugins import Draw
 from streamlit_folium import st_folium
 
+# Functions
 
-def dict_to_latlng(d):
-    return [d['lat'], d['lng']]
 
+# Starting variables
+center = [45.503032, -73.566424]
+zoom = 15
 
 # State variables
 if 'center' not in st.session_state:
-    st.session_state.center = [45.503032, -73.566424]
+    st.session_state.center = center
 
 if 'zoom' not in st.session_state:
-    st.session_state.zoom = 15
-
-# if 'location' not in st.session_state:
-#     st.session_state.location = folium.Marker(st.session_state.center)
-
-# if 'fg' not in st.session_state:
-#     st.session_state.fg = folium.FeatureGroup(name="Markers")
-
-m = folium.Map(location=st.session_state.center, zoom_start=st.session_state.zoom)
-fg = folium.FeatureGroup(name="Markers")
-fg.add_child(folium.Marker(st.session_state.center))
+    st.session_state.zoom = zoom
 
 # Layout
 st.set_page_config(layout="wide")
@@ -43,34 +33,35 @@ with st.sidebar:
     st.caption('The isochrone will be calculated around the point')
 
     # Create the map
+    m = folium.Map(location=center, zoom_start=zoom)
+    fg = folium.FeatureGroup(name="Markers")
 
-    # fg = folium.FeatureGroup(name="Markers")
-    # fg.add_child(st.session_state.location)
-    # st.session_state.fg.add_child(st.session_state.location)
-    # st.session_state.fg.add_child(folium.Marker(st.session_state.center))
-
-    # When the user clicks
+    # When the user pans the map ...
     map_state_change = st_folium(
         m,
+        # center=st.session_state["center"],
+        # zoom=st.session_state["zoom"],
+        key="new",
         feature_group_to_add=fg,
         height=400,
         width='100%',
-        returned_objects=['last_clicked', 'zoom', 'bounds', 'center'],
+        returned_objects=['center', 'zoom'],
     )
-    print(map_state_change)
+    # print(map_state_change)
+    fg.add_child(folium.Marker(st.session_state["center"]))
 
-    if map_state_change['last_clicked']:
-        # try:
-        center = dict_to_latlng(map_state_change['last_clicked'])
-        # st.session_state.center = [loc['lat'], loc['lng']]
-        # st.session_state.center = [loc['lat'], loc['lng']]
-        # st.session_state.location = folium.Marker(st.session_state.center)
-        # s.add_child(st.session_state.location)
-        fg.add_child(folium.Marker(center))
-    # except Exception as e:
-    #     pass
+    btn_click = st.button('Set location')
+    if btn_click:
+        fg.add_child(folium.Marker(st.session_state["center"]))
+        st.write(st.session_state["center"])
 
-    # st.write(st.session_state.center)
+    # # ... track the center
+    # if 'center' in map_state_change:
+    #     st.session_state.center = [map_state_change['center']['lat'], map_state_change['center']['lng']]
+    #     st.session_state.zoom = map_state_change['zoom']
+
+    # st.session_state.center = [map_state_change['center']['lat'], map_state_change['center']['lng']]
+    # st.session_state.zoom = map_state_change['zoom']
 
     # Distance Controls
     st.subheader('Accessibility Controls')
