@@ -1,88 +1,433 @@
 import folium
 import streamlit as st
+import osmnx as ox
+import networkx as nx
+import pydeck as pdk
+import geopandas as gpd
 
-from operator import itemgetter
-from folium.plugins import Draw
+from geonetworkx.tools import get_alpha_shape_polygon
+
 from streamlit_folium import st_folium
+from shapely.geometry import Point, Polygon, MultiPolygon
+
+st.set_page_config(layout="wide")
+
+st.markdown(
+    """
+<style>
+
+#root > div:nth-child(1) > div.withScreencast > div > div > div > section:nth-child(1) > div:nth-child(1) 
+    > div:nth-child(2) > div > div:nth-child(1) > div > div:nth-child(2) > div:nth-child(1) > div > div:nth-child(3) 
+    > div > div:nth-child(2) {
+        position: absolute;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        text-align: center;
+        align-content: center;
+        justify-content: center;
+        align-items: center;
+        top: calc(50% - 48px);
+        pointer-events: none;
+}
+
+#root > div:nth-child(1) > div.withScreencast > div > div > div > section:nth-child(1) > div:nth-child(1) 
+    > div:nth-child(2) > div > div:nth-child(1) > div > div:nth-child(2) > div:nth-child(1) > div > div:nth-child(3) 
+    > div > div:nth-child(2) > div {
+        display: flex;
+        align-content: center;
+        justify-content: center;
+        align-items: center;
+}
+
+#root > div:nth-child(1) > div.withScreencast > div > div > div > section:nth-child(1) > div:nth-child(1) 
+    > div:nth-child(2) > div > div:nth-child(1) > div > div:nth-child(2) > div:nth-child(1) > div > div:nth-child(3) 
+    > div > div:nth-child(2) > div > div > p {
+        display: flex;
+        text-align: center;
+        color: rgb(255, 75, 75);
+        font-weight: bold;
+        margin: 0;
+        font-size: 50px;
+        align-content: center;
+        justify-content: center;
+        align-items: center;
+        text-shadow: 5px 5px 5px grey;
+}
+</style>
+""",
+    unsafe_allow_html=True
+)
+
+# Constants
+PALETTE = {
+    'red': [255, 75, 75],
+    'white': [255, 255, 255],
+    'yellow': [255, 249, 127],
+    'teal': [0, 108, 103],
+    'beige': [255, 235, 198],
+    'orange': [255, 177, 0],
+    'blue': [0, 56, 68],
+    'cyan': [0, 148, 198],
+    'green': [46, 204, 113]
+}
 
 
-def dict_to_latlng(d):
-    return [d['lat'], d['lng']]
+# Functions
+def plug_shape_holes(geom):
+    if geom.geom_type.lower() == 'multipolygon':
+        return MultiPolygon([Polygon(p.exterior) for p in shape_concave.geoms]).buffer(0)
+    if geom.geom_type.lower() == 'polygon':
+        return Polygon(geom.exterior)
 
+
+# Starting variables
+center = [45.503032, -73.566424]
+zoom = 15
+source_ = center
+use_time = False
 
 # State variables
 if 'center' not in st.session_state:
-    st.session_state.center = [45.503032, -73.566424]
+    st.session_state.center = center
 
 if 'zoom' not in st.session_state:
-    st.session_state.zoom = 15
+    st.session_state.zoom = zoom
 
-# if 'location' not in st.session_state:
-#     st.session_state.location = folium.Marker(st.session_state.center)
+if "cost_type" not in st.session_state:
+    st.session_state.cost_type = 'distance'
 
-# if 'fg' not in st.session_state:
-#     st.session_state.fg = folium.FeatureGroup(name="Markers")
-
-m = folium.Map(location=st.session_state.center, zoom_start=st.session_state.zoom)
+# Map
+m = folium.Map(location=center, zoom_start=zoom)
 fg = folium.FeatureGroup(name="Markers")
-fg.add_child(folium.Marker(st.session_state.center))
 
 # Layout
-st.set_page_config(layout="wide")
-
 st.title('Welcome to the Isochrone calculator app!')
 
 tab1, tab2 = st.tabs(["Isochrone Calculator", "About Accessibility"])
 
 # Sidebar Controls
 with st.sidebar:
-    st.header('Controls')
+    st.title('Controls')
 
-    # Map Controls
-    st.subheader('Choose a location')
-    st.caption('The isochrone will be calculated around the point')
+    with st.form("map_form"):
 
-    # Create the map
+        # Map Controls
+        st.subheader('Choose a location')
+        st.caption('The isochrone will be calculated around the point')
 
-    # fg = folium.FeatureGroup(name="Markers")
-    # fg.add_child(st.session_state.location)
-    # st.session_state.fg.add_child(st.session_state.location)
-    # st.session_state.fg.add_child(folium.Marker(st.session_state.center))
+        # Create the map
+        with st.container():
 
-    # When the user clicks
-    map_state_change = st_folium(
-        m,
-        feature_group_to_add=fg,
-        height=400,
-        width='100%',
-        returned_objects=['last_clicked', 'zoom', 'bounds', 'center'],
-    )
-    print(map_state_change)
+            # When the user pans the map ...
+            map_state_change = st_folium(
+                m,
+                key="new",
+                feature_group_to_add=fg,
+                height=300,
+                width='100%',
+                returned_objects=['center', 'zoom'],
+            )
 
-    if map_state_change['last_clicked']:
-        # try:
-        center = dict_to_latlng(map_state_change['last_clicked'])
-        # st.session_state.center = [loc['lat'], loc['lng']]
-        # st.session_state.center = [loc['lat'], loc['lng']]
-        # st.session_state.location = folium.Marker(st.session_state.center)
-        # s.add_child(st.session_state.location)
-        fg.add_child(folium.Marker(center))
-    # except Exception as e:
-    #     pass
+            st.write('⌖')
 
-    # st.write(st.session_state.center)
+            if 'center' in map_state_change:
+                st.session_state.center = [map_state_change['center']['lat'], map_state_change['center']['lng']]
 
-    # Distance Controls
+            if 'zoom' in map_state_change:
+                st.session_state.zoom = map_state_change['zoom']
+
+        with st.container():
+            col1, col2 = st.columns([2, 1])
+
+            with col1:
+                dec = 10
+                st.write(round(st.session_state.center[0], dec), ', ', round(st.session_state.center[1], dec))
+
+            with col2:
+                # btn_click = st.button('Set location')
+                submitted = st.form_submit_button("Set location")
+                # if btn_click:
+                if submitted:
+                    source_ = st.session_state["center"]
+                    fg.add_child(folium.Marker(st.session_state["center"]))
+
+    # Distance/Accessibility Controls
     st.subheader('Accessibility Controls')
-    distance = st.slider('Select a maximum walking distance (m)', 250, 1000, 500, 50)
-    st.write("I'm ", distance, 'years old')
 
-    st.subheader('Choose a location')
+    # st.radio(
+    #     "Distance or travel time threshold 👇",
+    #     ["Distance", "Time", ],
+    #     key="cost_type",
+    #     horizontal=True,
+    # )
+    distance = st.slider('Select a maximum walking distance (m)', 250, 1000, 500, 50)
+    interval = st.slider('Select an interval (m)', 50, 250, 100, 50)
+    if interval >= distance:
+        st.error('Interval must be smaller than maximum distance', icon="🚨")
+    else:
+        st.empty()
+
+    st.divider()
+
+    # Shape Controls - Vector
+    st.subheader('Shape Approximation Controls')
+
+    st.markdown('#### Concave Shape')
+    alpha = st.slider('Select the alpha percentile', 0, 100, 85, 1,
+                      help='Applies to the concave hull creation. Will keep "percentile" percent of triangles')
+    plug_holes = st.checkbox('Fill in holes', value=False,
+                             help='If the resulting shape contains holes, it will plug/remove them')
+    force_single = st.checkbox('Force single part shape', value=False,
+                               help='If the resulting shape is not a single polygon, it will modify the alpha shape '
+                                    'parameter until it becomes a single shape. Will override the alpha percentile '
+                                    'parameter.')
+    new_alpha = alpha
+
+    if new_alpha != alpha:
+        st.write('Overwritten alpha percentile:', new_alpha)
+
+    st.markdown('#### Link Offset Shape')
+    offset = st.slider('Select an offset distance (m)', 5, 100, 25, 5,
+                       help='Applies to both link offset and node buffers')
+    cap_style = st.radio(
+        "Buffer cap style",
+        ["round", "square", "flat"],
+        key="cap_style",
+        horizontal=True,
+    )
+    clip_to_buffer = st.checkbox('Clip shape to buffer', value=False,
+                                 help='With the offset method, the resulting shape can overflow the cicular buffer. '
+                                      'Checking the box will remove the excess.')
+
+    st.markdown('#### Grid interpolation')
+    cell_size = st.slider('Select a resolution for the interpolation (m)', 10, 100, 25, 5)
+    algo = st.radio(
+        "Interpolation algorithm",
+        ["Triangular Irregular Network (TIN)", "Inverse Distance Weighting (IDW)"],
+        key="algo",
+        horizontal=True,
+    )
 
 # Isochrone calculation
 with tab1:
-    st.header("A cat")
-    st.image("https://static.streamlit.io/examples/cat.jpg", width=200)
+    # All map calculations here
+    # Build the graph
+    graph = ox.graph_from_point(source_, network_type='walk', dist=distance + 250)
+    nodes, edges = ox.utils_graph.graph_to_gdfs(graph)
+
+    # Get UTM crs for distance based geoprocessing
+    utm_crs = nodes.estimate_utm_crs()
+
+    # Construct GeoDataFrames
+    source = gpd.GeoDataFrame(geometry=[Point(source_[::-1])], crs='epsg:4326')
+    buffer = source.to_crs(utm_crs).buffer(distance).to_crs('epsg:4326')
+
+    # Merge source to graph
+    # gnx.spatial_points_merge(graph, source, inplace=True)
+
+    # Clip
+    nodes = nodes.clip(buffer)
+    edges = edges.clip(buffer)
+
+    # Viewport
+    viewport = pdk.data_utils.compute_view(points=[[p.xy[0][0], p.xy[1][0]] for p in nodes.geometry.to_list()],
+                                           view_proportion=0.9)
+
+    # Find the closest node to source_
+    start_node = ox.nearest_nodes(graph, source_[1], source_[0])
+
+    # Get start node as gdf for plotting
+    start_point = nodes[nodes.index == start_node].copy()
+
+    # if use_time:
+    #     # Reproject the graph
+    #     graph_utm = ox.project_graph()
+    #
+    #     # Add travel time as cost
+    #     meters_per_minute = travel_speed * 1000 / 60  # km per hour to m per minute
+    #     for u, v, k, data in graph.edges(data=True, keys=True):
+    #         data['time'] = data['length'] / meters_per_minute
+
+    # Calculate isochrone
+    subgraph = nx.ego_graph(graph, start_node, radius=distance, distance='length')
+    acc_nodes, acc_edges = ox.utils_graph.graph_to_gdfs(subgraph)
+
+    # Convex shape
+    shape_convex = acc_nodes.unary_union.convex_hull
+    shape_convex_df = gpd.GeoDataFrame(geometry=[shape_convex], crs='epsg:4326')
+
+    # Concave shape
+    pts = list(acc_nodes.to_crs(utm_crs).geometry.apply(lambda p: (p.x, p.y)))
+    shape_concave = get_alpha_shape_polygon(pts, alpha)
+
+    # Concave shape - CONDITION - no holes
+    if plug_holes:
+        shape_concave = plug_shape_holes(shape_concave)
+
+    # Concave shape - CONDITION - single part geometry
+    if force_single:
+        while shape_concave.geom_type.lower() == 'multipolygon':
+            if new_alpha == 100:
+                break
+            new_alpha += 1
+            shape_concave = get_alpha_shape_polygon(pts, new_alpha)
+            if plug_holes:
+                shape_concave = plug_shape_holes(shape_concave)
+            st.write('Overwritten alpha percentile:', new_alpha)
+
+    shape_concave_df = gpd.GeoDataFrame(geometry=[shape_concave], crs=utm_crs).to_crs(
+        'epsg:4326')
+
+    # Offset shape
+    shape_offset = acc_edges.to_crs(utm_crs).buffer(offset, cap_style='round').unary_union
+    shape_offset_df = gpd.GeoDataFrame(geometry=[shape_offset], crs=utm_crs).to_crs(
+        'epsg:4326')
+
+    with st.container():
+        col1, col2 = st.columns([4, 1])
+
+        with col1:
+            st.markdown(f'### Walking Network Inside {distance} m Buffer')
+
+            st.pydeck_chart(pdk.Deck(
+                initial_view_state=viewport,
+                layers=[
+                    pdk.Layer(
+                        type="GeoJsonLayer",
+                        data=buffer,
+                        get_fill_color=PALETTE['red'] + [25],
+                        get_line_color=PALETTE['red'] + [200],
+                        line_width_max_pixels=1,
+                        stroked=True,
+                        filled=True,
+                        # pickable=True,
+                        auto_highlight=True,
+                        # tooltip=True
+                    ),
+                    pdk.Layer(
+                        type="GeoJsonLayer",
+                        data=source,
+                        get_radius=20,
+                        get_fill_color=PALETTE['yellow'] + [200],
+                        get_line_color=PALETTE['white'] + [100],
+                        line_width_max_pixels=3,
+                        stroked=True,
+                        # filled=True,
+                        pickable=True,
+                        auto_highlight=True,
+                        # tooltip=True
+                    ),
+                    pdk.Layer(
+                        type="GeoJsonLayer",
+                        data=shape_convex_df,
+                        get_fill_color=PALETTE['teal'] + [100],
+                        get_line_color=PALETTE['teal'] + [200],
+                        line_width_max_pixels=1,
+                        stroked=True,
+                        filled=True,
+                        pickable=True,
+                        auto_highlight=True,
+                        # extruded=True,
+                        # get_elevation=10,
+                        # tooltip=True
+                    ),
+                    pdk.Layer(
+                        type="GeoJsonLayer",
+                        data=shape_concave_df,
+                        get_fill_color=PALETTE['cyan'] + [100],
+                        get_line_color=PALETTE['beige'] + [200],
+                        line_width_max_pixels=1,
+                        stroked=True,
+                        filled=True,
+                        pickable=True,
+                        auto_highlight=True,
+                        # extruded=True,
+                        # get_elevation=30,
+                        # tooltip=True
+                    ),
+                    pdk.Layer(
+                        type="GeoJsonLayer",
+                        data=shape_offset_df,
+                        get_fill_color=PALETTE['green'] + [100],
+                        get_line_color=PALETTE['blue'] + [200],
+                        line_width_max_pixels=1,
+                        stroked=True,
+                        filled=True,
+                        pickable=True,
+                        auto_highlight=True,
+                        # extruded=True,
+                        # get_elevation=50,
+                        # tooltip=True
+                    ),
+                    pdk.Layer(
+                        type="GeoJsonLayer",
+                        data=start_point,
+                        get_radius=10,
+                        get_fill_color=(255, 137, 93, 255),
+                        get_line_color=[255, 255, 255, 100],
+                        line_width_max_pixels=3,
+                        stroked=True,
+                        # filled=True,
+                        pickable=True,
+                        auto_highlight=True,
+                        # tooltip=True
+                    ),
+                    pdk.Layer(
+                        type="GeoJsonLayer",
+                        data=edges,
+                        get_line_color=[255, 255, 255],
+                        line_width_min_pixels=1,
+                        stroked=True,
+                        filled=True,
+                        pickable=True,
+                        auto_highlight=True,
+                        # tooltip=True
+                    ),
+                    pdk.Layer(
+                        type="GeoJsonLayer",
+                        data=acc_edges,
+                        get_line_color=[255, 75, 75],
+                        line_width_min_pixels=2,
+                        stroked=True,
+                        filled=True,
+                        pickable=True,
+                        auto_highlight=True,
+                        # tooltip=True
+                    ),
+                    pdk.Layer(
+                        type="GeoJsonLayer",
+                        data=nodes,
+                        get_radius=3,
+                        # get_fill_color=[255, 75, 75],
+                        get_fill_color=[255, 255, 255],
+                        get_line_color=[255, 255, 255, 100],
+                        line_width_max_pixels=3,
+                        stroked=True,
+                        # filled=True,
+                        pickable=True,
+                        auto_highlight=True,
+                        # tooltip=True
+                    ),
+                    pdk.Layer(
+                        type="GeoJsonLayer",
+                        data=acc_nodes,
+                        get_radius=3,
+                        get_fill_color=[255, 75, 75],
+                        # get_fill_color=[255, 255, 255],
+                        get_line_color=[255, 255, 255, 100],
+                        line_width_max_pixels=3,
+                        stroked=True,
+                        # filled=True,
+                        pickable=True,
+                        auto_highlight=True,
+                        # tooltip=True
+                    ),
+
+                ]
+            ))
+    with col2:
+        st.markdown('### Legend')
 
 # Explanations
 with tab2:
