@@ -1,14 +1,33 @@
+import warnings
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
 import folium
 import streamlit as st
 import osmnx as ox
 import networkx as nx
 import pydeck as pdk
-import geopandas as gpd
+
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
 from geonetworkx.tools import get_alpha_shape_polygon
 
+import rasterio
+from rasterio.transform import Affine
+from rasterio.io import MemoryFile
+from rasterio.mask import mask
+
+from scipy.spatial.distance import cdist
+
 from streamlit_folium import st_folium
 from shapely.geometry import Point, Polygon, MultiPolygon
+from shapely.errors import ShapelyDeprecationWarning
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=ShapelyDeprecationWarning)
 
 st.set_page_config(layout="wide")
 
@@ -79,6 +98,76 @@ def plug_shape_holes(geom):
         return MultiPolygon([Polygon(p.exterior) for p in shape_concave.geoms]).buffer(0)
     if geom.geom_type.lower() == 'polygon':
         return Polygon(geom.exterior)
+
+
+def idw(node_vals, target_resolution, out_crs, clip_df=None, p=3):
+    # Get reference to coordinates and distance values from nodes
+    points = node_vals.to_crs(utm_crs).geometry.values
+    points = [(p.x, p.y) for p in points]
+    vals = node_vals['dist'].values
+
+    # Calculate the minimum and maximum bounds of the GeoDataFrame
+    xmin, ymin, xmax, ymax = buffer.to_crs(out_crs).total_bounds
+
+    # Calculate the number of pixels in the x and y directions based on the target resolution
+    num_pixels_x = int((xmax - xmin) / target_resolution)
+    num_pixels_y = int((ymax - ymin) / target_resolution)
+
+    # Create a regular grid of points for interpolation based on the target resolution
+    grid_x, grid_y = np.meshgrid(np.linspace(xmin, xmax, num_pixels_x), np.linspace(ymin, ymax, num_pixels_y))
+
+    # Calculate the distance matrix between the points and grid points
+    distances = cdist(points, np.c_[grid_x.ravel(), grid_y.ravel()])
+
+    # Perform IDW interpolation
+    weights = 1 / np.power(distances, p)
+    # weights = 1 / distances
+    interpolated_elevation = np.sum(weights * vals[:, np.newaxis], axis=0) / np.sum(weights, axis=0)
+
+    # Reshape the interpolated elevation values to match the grid shape
+    interpolated_elevation = interpolated_elevation.reshape(grid_x.shape)
+
+    # Create an in-memory raster using rasterio
+    height, width = interpolated_elevation.shape
+    # transform = from_origin(xmin, ymax, (xmax - xmin) / width, (ymax - ymin) / height)
+    transform = Affine.translation(xmin - target_resolution / 2, ymin - target_resolution / 2) * Affine.scale(
+        target_resolution, target_resolution)
+
+    # Prepare mask geometry (will need to be inverted)
+    if clip_df:
+        shapes = [clip_df.to_crs(utm_crs).values[0]]
+
+    # Profile
+    profile = {
+        # 'driver': 'MEM',
+        'driver': 'GTiff',
+        'dtype': rasterio.float32,
+        'count': 1,
+        'width': width,
+        'height': height,
+        'transform': transform,
+        'crs': utm_crs
+    }
+
+    # Write the interpolated elevation values to the in-memory raster
+    with MemoryFile() as memfile:
+        with memfile.open(**profile) as dataset:
+            dataset.write(interpolated_elevation[::-1], 1)
+
+        # Read the dataset right away
+        src = memfile.open(**profile)
+
+        # Unmaksed image
+        img = src.read(1)
+
+        # Masked inmage
+        if clip_df:
+            img_maksed, transform = mask(src, shapes, crop=True, filled=False)
+
+    if clip_df:
+        return img_maksed
+    else:
+        return img
 
 
 # Starting variables
@@ -256,6 +345,7 @@ with tab1:
     # Convex shape
     shape_convex = acc_nodes.unary_union.convex_hull
     shape_convex_df = gpd.GeoDataFrame(geometry=[shape_convex], crs='epsg:4326')
+    shape_convex_area = round(shape_convex_df.to_crs(utm_crs).iloc[0].geometry.area / 1000000, 2)
 
     # Concave shape
     pts = list(acc_nodes.to_crs(utm_crs).geometry.apply(lambda p: (p.x, p.y)))
@@ -276,156 +366,512 @@ with tab1:
                 shape_concave = plug_shape_holes(shape_concave)
             st.write('Overwritten alpha percentile:', new_alpha)
 
+    shape_concave_area = round(shape_concave.area / 1000000)
     shape_concave_df = gpd.GeoDataFrame(geometry=[shape_concave], crs=utm_crs).to_crs(
         'epsg:4326')
 
     # Offset shape
     shape_offset = acc_edges.to_crs(utm_crs).buffer(offset, cap_style='round').unary_union
+    shape_offset_area = round(shape_offset.area / 1000000)
     shape_offset_df = gpd.GeoDataFrame(geometry=[shape_offset], crs=utm_crs).to_crs(
         'epsg:4326')
+
+    # Prepare points layer with column with values to interpolate
+    node_dists = nx.single_source_dijkstra_path_length(subgraph, start_node, weight='length')
+    node_dists = pd.DataFrame(data=[(k, v) for k, v in node_dists.items()], columns=['osmid', 'dist']).set_index(
+        'osmid')
+    node_dists = gpd.GeoDataFrame(node_dists.merge(acc_nodes, left_index=True, right_index=True), geometry='geometry',
+                                  crs=acc_nodes.crs)
+
+    # Add color columns
+    colormap = plt.cm.YlOrRd
+    normalized_values = (node_dists['dist'] - node_dists['dist'].min()) / (
+            node_dists['dist'].max() - node_dists['dist'].min())
+    node_dists['color_hex'] = normalized_values.apply(lambda x: mcolors.to_hex(colormap(x)))
+    node_dists['color_rgb'] = normalized_values.apply(
+        lambda x: (np.array(mcolors.to_rgb(colormap(x))) * 255).astype(np.uint8))
+
+    # Perform the interpolation
 
     with st.container():
         col1, col2 = st.columns([4, 1])
 
         with col1:
-            st.markdown(f'### Walking Network Inside {distance} m Buffer')
+            inner_col1, inner_col2 = st.columns(2)
+            with inner_col1:
+                # Buffer + Convex
+                st.markdown(f'### Buffer vs Convex Shape')
+                st.pydeck_chart(pdk.Deck(
+                    initial_view_state=viewport,
+                    layers=[
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=buffer,
+                            get_fill_color=PALETTE['red'] + [25],
+                            get_line_color=PALETTE['red'] + [200],
+                            line_width_max_pixels=1,
+                            stroked=True,
+                            filled=True,
+                            # pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=source,
+                            get_radius=20,
+                            get_fill_color=PALETTE['yellow'] + [200],
+                            get_line_color=PALETTE['white'] + [100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=shape_convex_df,
+                            get_fill_color=PALETTE['teal'] + [100],
+                            get_line_color=PALETTE['teal'] + [200],
+                            line_width_max_pixels=1,
+                            stroked=True,
+                            filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # extruded=True,
+                            # get_elevation=10,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=start_point,
+                            get_radius=10,
+                            get_fill_color=(255, 137, 93, 255),
+                            get_line_color=[255, 255, 255, 100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=edges,
+                            get_line_color=[255, 255, 255],
+                            line_width_min_pixels=1,
+                            stroked=True,
+                            filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=acc_edges,
+                            get_line_color=[255, 75, 75],
+                            line_width_min_pixels=2,
+                            stroked=True,
+                            filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=nodes,
+                            get_radius=3,
+                            # get_fill_color=[255, 75, 75],
+                            get_fill_color=[255, 255, 255],
+                            get_line_color=[255, 255, 255, 100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=acc_nodes,
+                            get_radius=3,
+                            get_fill_color=[255, 75, 75],
+                            # get_fill_color=[255, 255, 255],
+                            get_line_color=[255, 255, 255, 100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
 
-            st.pydeck_chart(pdk.Deck(
-                initial_view_state=viewport,
-                layers=[
-                    pdk.Layer(
-                        type="GeoJsonLayer",
-                        data=buffer,
-                        get_fill_color=PALETTE['red'] + [25],
-                        get_line_color=PALETTE['red'] + [200],
-                        line_width_max_pixels=1,
-                        stroked=True,
-                        filled=True,
-                        # pickable=True,
-                        auto_highlight=True,
-                        # tooltip=True
-                    ),
-                    pdk.Layer(
-                        type="GeoJsonLayer",
-                        data=source,
-                        get_radius=20,
-                        get_fill_color=PALETTE['yellow'] + [200],
-                        get_line_color=PALETTE['white'] + [100],
-                        line_width_max_pixels=3,
-                        stroked=True,
-                        # filled=True,
-                        pickable=True,
-                        auto_highlight=True,
-                        # tooltip=True
-                    ),
-                    pdk.Layer(
-                        type="GeoJsonLayer",
-                        data=shape_convex_df,
-                        get_fill_color=PALETTE['teal'] + [100],
-                        get_line_color=PALETTE['teal'] + [200],
-                        line_width_max_pixels=1,
-                        stroked=True,
-                        filled=True,
-                        pickable=True,
-                        auto_highlight=True,
-                        # extruded=True,
-                        # get_elevation=10,
-                        # tooltip=True
-                    ),
-                    pdk.Layer(
-                        type="GeoJsonLayer",
-                        data=shape_concave_df,
-                        get_fill_color=PALETTE['cyan'] + [100],
-                        get_line_color=PALETTE['beige'] + [200],
-                        line_width_max_pixels=1,
-                        stroked=True,
-                        filled=True,
-                        pickable=True,
-                        auto_highlight=True,
-                        # extruded=True,
-                        # get_elevation=30,
-                        # tooltip=True
-                    ),
-                    pdk.Layer(
-                        type="GeoJsonLayer",
-                        data=shape_offset_df,
-                        get_fill_color=PALETTE['green'] + [100],
-                        get_line_color=PALETTE['blue'] + [200],
-                        line_width_max_pixels=1,
-                        stroked=True,
-                        filled=True,
-                        pickable=True,
-                        auto_highlight=True,
-                        # extruded=True,
-                        # get_elevation=50,
-                        # tooltip=True
-                    ),
-                    pdk.Layer(
-                        type="GeoJsonLayer",
-                        data=start_point,
-                        get_radius=10,
-                        get_fill_color=(255, 137, 93, 255),
-                        get_line_color=[255, 255, 255, 100],
-                        line_width_max_pixels=3,
-                        stroked=True,
-                        # filled=True,
-                        pickable=True,
-                        auto_highlight=True,
-                        # tooltip=True
-                    ),
-                    pdk.Layer(
-                        type="GeoJsonLayer",
-                        data=edges,
-                        get_line_color=[255, 255, 255],
-                        line_width_min_pixels=1,
-                        stroked=True,
-                        filled=True,
-                        pickable=True,
-                        auto_highlight=True,
-                        # tooltip=True
-                    ),
-                    pdk.Layer(
-                        type="GeoJsonLayer",
-                        data=acc_edges,
-                        get_line_color=[255, 75, 75],
-                        line_width_min_pixels=2,
-                        stroked=True,
-                        filled=True,
-                        pickable=True,
-                        auto_highlight=True,
-                        # tooltip=True
-                    ),
-                    pdk.Layer(
-                        type="GeoJsonLayer",
-                        data=nodes,
-                        get_radius=3,
-                        # get_fill_color=[255, 75, 75],
-                        get_fill_color=[255, 255, 255],
-                        get_line_color=[255, 255, 255, 100],
-                        line_width_max_pixels=3,
-                        stroked=True,
-                        # filled=True,
-                        pickable=True,
-                        auto_highlight=True,
-                        # tooltip=True
-                    ),
-                    pdk.Layer(
-                        type="GeoJsonLayer",
-                        data=acc_nodes,
-                        get_radius=3,
-                        get_fill_color=[255, 75, 75],
-                        # get_fill_color=[255, 255, 255],
-                        get_line_color=[255, 255, 255, 100],
-                        line_width_max_pixels=3,
-                        stroked=True,
-                        # filled=True,
-                        pickable=True,
-                        auto_highlight=True,
-                        # tooltip=True
-                    ),
+                    ]
+                ))
 
-                ]
-            ))
+                # Buffer + Offset
+                st.markdown(f'### Buffer vs Offset Shape')
+                st.pydeck_chart(pdk.Deck(
+                    initial_view_state=viewport,
+                    layers=[
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=buffer,
+                            get_fill_color=PALETTE['red'] + [25],
+                            get_line_color=PALETTE['red'] + [200],
+                            line_width_max_pixels=1,
+                            stroked=True,
+                            filled=True,
+                            # pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=source,
+                            get_radius=20,
+                            get_fill_color=PALETTE['yellow'] + [200],
+                            get_line_color=PALETTE['white'] + [100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=shape_offset_df,
+                            get_fill_color=PALETTE['green'] + [100],
+                            get_line_color=PALETTE['blue'] + [200],
+                            line_width_max_pixels=1,
+                            stroked=True,
+                            filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # extruded=True,
+                            # get_elevation=50,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=start_point,
+                            get_radius=10,
+                            get_fill_color=(255, 137, 93, 255),
+                            get_line_color=[255, 255, 255, 100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=edges,
+                            get_line_color=[255, 255, 255],
+                            line_width_min_pixels=1,
+                            stroked=True,
+                            filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=acc_edges,
+                            get_line_color=[255, 75, 75],
+                            line_width_min_pixels=2,
+                            stroked=True,
+                            filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=nodes,
+                            get_radius=3,
+                            # get_fill_color=[255, 75, 75],
+                            get_fill_color=[255, 255, 255],
+                            get_line_color=[255, 255, 255, 100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=acc_nodes,
+                            get_radius=3,
+                            get_fill_color=[255, 75, 75],
+                            # get_fill_color=[255, 255, 255],
+                            get_line_color=[255, 255, 255, 100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+
+                    ]
+                ))
+
+            with inner_col2:
+                # Buffer + Concave
+                st.markdown(f'### Buffer vs concave Shape')
+                st.pydeck_chart(pdk.Deck(
+                    initial_view_state=viewport,
+                    layers=[
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=buffer,
+                            get_fill_color=PALETTE['red'] + [25],
+                            get_line_color=PALETTE['red'] + [200],
+                            line_width_max_pixels=1,
+                            stroked=True,
+                            filled=True,
+                            # pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=source,
+                            get_radius=20,
+                            get_fill_color=PALETTE['yellow'] + [200],
+                            get_line_color=PALETTE['white'] + [100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=shape_concave_df,
+                            get_fill_color=PALETTE['cyan'] + [100],
+                            get_line_color=PALETTE['beige'] + [200],
+                            line_width_max_pixels=1,
+                            stroked=True,
+                            filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # extruded=True,
+                            # get_elevation=30,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=start_point,
+                            get_radius=10,
+                            get_fill_color=(255, 137, 93, 255),
+                            get_line_color=[255, 255, 255, 100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=edges,
+                            get_line_color=[255, 255, 255],
+                            line_width_min_pixels=1,
+                            stroked=True,
+                            filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=acc_edges,
+                            get_line_color=[255, 75, 75],
+                            line_width_min_pixels=2,
+                            stroked=True,
+                            filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=nodes,
+                            get_radius=3,
+                            # get_fill_color=[255, 75, 75],
+                            get_fill_color=[255, 255, 255],
+                            get_line_color=[255, 255, 255, 100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+                        pdk.Layer(
+                            type="GeoJsonLayer",
+                            data=acc_nodes,
+                            get_radius=3,
+                            get_fill_color=[255, 75, 75],
+                            # get_fill_color=[255, 255, 255],
+                            get_line_color=[255, 255, 255, 100],
+                            line_width_max_pixels=3,
+                            stroked=True,
+                            # filled=True,
+                            pickable=True,
+                            auto_highlight=True,
+                            # tooltip=True
+                        ),
+
+                    ]
+                ))
+
+                # Buffer + Concave
+                st.markdown(f'### Grid Interpolation with Contours')
+
+                # st.pydeck_chart(pdk.Deck(
+                #     initial_view_state=viewport,
+                #     layers=[
+                #         pdk.Layer(
+                #             type="GeoJsonLayer",
+                #             data=buffer,
+                #             get_fill_color=PALETTE['red'] + [25],
+                #             get_line_color=PALETTE['red'] + [200],
+                #             line_width_max_pixels=1,
+                #             stroked=True,
+                #             filled=True,
+                #             # pickable=True,
+                #             auto_highlight=True,
+                #             # tooltip=True
+                #         ),
+                #         pdk.Layer(
+                #             type="GeoJsonLayer",
+                #             data=source,
+                #             get_radius=20,
+                #             get_fill_color=PALETTE['yellow'] + [200],
+                #             get_line_color=PALETTE['white'] + [100],
+                #             line_width_max_pixels=3,
+                #             stroked=True,
+                #             # filled=True,
+                #             pickable=True,
+                #             auto_highlight=True,
+                #             # tooltip=True
+                #         ),
+                #         pdk.Layer(
+                #             type="GeoJsonLayer",
+                #             data=shape_convex_df,
+                #             get_fill_color=PALETTE['teal'] + [100],
+                #             get_line_color=PALETTE['teal'] + [200],
+                #             line_width_max_pixels=1,
+                #             stroked=True,
+                #             filled=True,
+                #             pickable=True,
+                #             auto_highlight=True,
+                #             # extruded=True,
+                #             # get_elevation=10,
+                #             # tooltip=True
+                #         ),
+                #         pdk.Layer(
+                #             type="GeoJsonLayer",
+                #             data=shape_concave_df,
+                #             get_fill_color=PALETTE['cyan'] + [100],
+                #             get_line_color=PALETTE['beige'] + [200],
+                #             line_width_max_pixels=1,
+                #             stroked=True,
+                #             filled=True,
+                #             pickable=True,
+                #             auto_highlight=True,
+                #             # extruded=True,
+                #             # get_elevation=30,
+                #             # tooltip=True
+                #         ),
+                #         pdk.Layer(
+                #             type="GeoJsonLayer",
+                #             data=shape_offset_df,
+                #             get_fill_color=PALETTE['green'] + [100],
+                #             get_line_color=PALETTE['blue'] + [200],
+                #             line_width_max_pixels=1,
+                #             stroked=True,
+                #             filled=True,
+                #             pickable=True,
+                #             auto_highlight=True,
+                #             # extruded=True,
+                #             # get_elevation=50,
+                #             # tooltip=True
+                #         ),
+                #         pdk.Layer(
+                #             type="GeoJsonLayer",
+                #             data=start_point,
+                #             get_radius=10,
+                #             get_fill_color=(255, 137, 93, 255),
+                #             get_line_color=[255, 255, 255, 100],
+                #             line_width_max_pixels=3,
+                #             stroked=True,
+                #             # filled=True,
+                #             pickable=True,
+                #             auto_highlight=True,
+                #             # tooltip=True
+                #         ),
+                #         pdk.Layer(
+                #             type="GeoJsonLayer",
+                #             data=edges,
+                #             get_line_color=[255, 255, 255],
+                #             line_width_min_pixels=1,
+                #             stroked=True,
+                #             filled=True,
+                #             pickable=True,
+                #             auto_highlight=True,
+                #             # tooltip=True
+                #         ),
+                #         pdk.Layer(
+                #             type="GeoJsonLayer",
+                #             data=acc_edges,
+                #             get_line_color=[255, 75, 75],
+                #             line_width_min_pixels=2,
+                #             stroked=True,
+                #             filled=True,
+                #             pickable=True,
+                #             auto_highlight=True,
+                #             # tooltip=True
+                #         ),
+                #         pdk.Layer(
+                #             type="GeoJsonLayer",
+                #             data=nodes,
+                #             get_radius=3,
+                #             # get_fill_color=[255, 75, 75],
+                #             get_fill_color=[255, 255, 255],
+                #             get_line_color=[255, 255, 255, 100],
+                #             line_width_max_pixels=3,
+                #             stroked=True,
+                #             # filled=True,
+                #             pickable=True,
+                #             auto_highlight=True,
+                #             # tooltip=True
+                #         ),
+                #         pdk.Layer(
+                #             type="GeoJsonLayer",
+                #             data=acc_nodes,
+                #             get_radius=3,
+                #             get_fill_color=[255, 75, 75],
+                #             # get_fill_color=[255, 255, 255],
+                #             get_line_color=[255, 255, 255, 100],
+                #             line_width_max_pixels=3,
+                #             stroked=True,
+                #             # filled=True,
+                #             pickable=True,
+                #             auto_highlight=True,
+                #             # tooltip=True
+                #         ),
+                #
+                #     ]
+                # ))
     with col2:
         st.markdown('### Legend')
 
