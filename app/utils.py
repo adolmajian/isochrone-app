@@ -4,17 +4,19 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import networkx as nx
+import pydeck as pdk
 
 import matplotlib.colors as mcolors
 
 from io import BytesIO
-from shapely.geometry import shape, MultiPoint, MultiPolygon, Polygon, LineString
+from shapely.geometry import shape, MultiPoint, MultiPolygon, Polygon, LineString, MultiLineString
 from shapelysmooth import taubin_smooth
 from scipy.spatial.distance import cdist
+from scipy.interpolate import LinearNDInterpolator
 
 import rasterio
 from rasterio import features
-from rasterio.transform import Affine
+from rasterio.transform import from_bounds
 from rasterio.io import MemoryFile
 from rasterio.mask import mask
 
@@ -25,11 +27,15 @@ PALETTE = {
     'white': [255, 255, 255],
     'yellow': [255, 249, 127],
     'teal': [0, 108, 103],
+    'aquamarine': [165, 255, 214],
+    'melon': [255, 166, 158],
     'beige': [255, 235, 198],
     'orange': [255, 177, 0],
+    'purple': [167, 7, 179],
+    'onyx': [46, 53, 50],
     'blue': [0, 56, 68],
     'cyan': [0, 148, 198],
-    'green': [46, 204, 113]
+    'purple': [136, 67, 204],
 }
 
 
@@ -65,6 +71,14 @@ def plug_shape_holes(geom):
         return Polygon(geom.exterior)
 
 
+def extract_exteriors(g):
+    if g.geom_type.lower() == 'multipolygon':
+        exteriors = [x.exterior for x in g.geoms]
+        return MultiLineString(exteriors)
+    else:
+        return LineString(g.exterior)
+
+
 def add_color_to_df(df, col, colormap):
     df = df.copy()
     normalized_values = (df[col] - df[col].min()) / (
@@ -94,7 +108,7 @@ def prepare_interpolation_points(subgraph, start_node, acc_nodes, colormap):
     return node_dists
 
 
-def idw(node_vals, ref_gdf, target_resolution, p=3, clip_df=True):
+def grid_interpolate(node_vals, ref_gdf, target_resolution, algo, p=3, clip_df=True):
     # Get crs
     ref_crs = ref_gdf.crs
 
@@ -113,22 +127,29 @@ def idw(node_vals, ref_gdf, target_resolution, p=3, clip_df=True):
     # Create a regular grid of points for interpolation based on the target resolution
     grid_x, grid_y = np.meshgrid(np.linspace(xmin, xmax, num_pixels_x), np.linspace(ymin, ymax, num_pixels_y))
 
-    # Calculate the distance matrix between the points and grid points
-    distances = cdist(points, np.c_[grid_x.ravel(), grid_y.ravel()])
+    if algo == 'idw':
+        # Calculate the distance matrix between the points and grid points
+        distances = cdist(points, np.c_[grid_x.ravel(), grid_y.ravel()])
 
-    # Perform IDW interpolation
-    weights = 1 / np.power(distances, p)
-    # weights = 1 / distances
-    interpolated_elevation = np.sum(weights * vals[:, np.newaxis], axis=0) / np.sum(weights, axis=0)
+        # Perform IDW interpolation
+        weights = 1 / np.power(distances, p)
+        # weights = 1 / distances
+        interpolated_elevation = np.sum(weights * vals[:, np.newaxis], axis=0) / np.sum(weights, axis=0)
 
-    # Reshape the interpolated elevation values to match the grid shape
-    interpolated_elevation = interpolated_elevation.reshape(grid_x.shape)
+        # Reshape the interpolated elevation values to match the grid shape
+        interpolated_elevation = interpolated_elevation.reshape(grid_x.shape)
+
+    if algo == 'tin':
+        # Perform TIN interpolation using LinearNDInterpolator
+        interpolator = LinearNDInterpolator(points, vals)
+        interpolated_elevation = interpolator(grid_x, grid_y)
+
+        # Reshape the interpolated elevation values to match the grid shape
+        interpolated_elevation = interpolated_elevation.reshape(grid_x.shape)
 
     # Create an in-memory raster using rasterio
     height, width = interpolated_elevation.shape
-    # transform = from_origin(xmin, ymax, (xmax - xmin) / width, (ymax - ymin) / height)
-    transform = Affine.translation(xmin - target_resolution / 2, ymin - target_resolution / 2) * Affine.scale(
-        target_resolution, target_resolution)
+    transform = from_bounds(xmin, ymin, xmax, ymax, width, height)  # west, south, east, north
 
     # Prepare mask geometry (will need to be inverted)
     if clip_df:
@@ -149,7 +170,9 @@ def idw(node_vals, ref_gdf, target_resolution, p=3, clip_df=True):
     # Write the interpolated elevation values to the in-memory raster
     with MemoryFile() as memfile:
         with memfile.open(**profile) as dataset:
-            dataset.write(interpolated_elevation[::-1], 1)
+            interpolated_elevation = interpolated_elevation[::-1]
+            # interpolated_elevation = interpolated_elevation
+            dataset.write(interpolated_elevation, 1)
 
         # Read the dataset right away
         src = memfile.open(**profile)
@@ -168,6 +191,9 @@ def idw(node_vals, ref_gdf, target_resolution, p=3, clip_df=True):
 
 
 def colorize_image(img, colormap):
+    # Correct the mask (add nodata values from data arr to mask arr)
+    img.mask[np.isnan(img.data)] = True
+
     # Convert the masked array to a regular array by filling the mask with 0s
     img_arr = np.ma.filled(img, fill_value=0).squeeze()
 
@@ -214,9 +240,8 @@ def extract_contours_from_singleband_raster(img, ref_ds, distance, interval, col
     geoms = []
     contour_vals = []
 
-    for contour in features.shapes(img_[::-1], transform=ref_ds.transform):
+    for contour in features.shapes(img_, transform=ref_ds.transform):
         contour_geom, contour_val = contour
-        # geoms.append(shape(contour_geom).boundary.simplify(target_resolution, preserve_topology=True))
         geoms.append(shape(contour_geom))
         contour_vals.append(contour_val)
 
@@ -228,40 +253,167 @@ def extract_contours_from_singleband_raster(img, ref_ds, distance, interval, col
     # Filter
     contours = contours[contours.contour.isin(levels)].sort_values('contour').reset_index(drop=True)
     contours = contours.dissolve('contour')
+    contours.reset_index(inplace=True)
 
     # Get correct ring
-    def get_correct_ring(g):
-        if g.geom_type.lower() == 'multipolygon':
-            idx_max = np.array([x.area for x in g.geoms]).argmax()
-            interiors = g.geoms[idx_max].interiors
+    # def get_correct_ring(row):
+    #     g = row.geometry
+    #     cval = row.contour
+    #
+    #     def extract_largest_ring(p):
+    #         interiors = p.interiors
+    #         if len(interiors) > 1:
+    #             idx_max = np.array([x.length for x in interiors]).argmax()
+    #             ring = interiors[int(idx_max)]
+    #
+    #             return LineString(ring)
+    #         else:
+    #             return p.boundary
+    #
+    #     if g.geom_type.lower() == 'multipolygon':
+    #         idx_max = np.array([x.area for x in g.geoms]).argmax()
+    #         if cval != distance:
+    #             return extract_largest_ring(g.geoms[idx_max])
+    #         else:
+    #             lines = [extract_largest_ring(g_) for g_ in g.geoms]
+    #             lines_ = []
+    #             for l in lines:
+    #                 if l.geom_type.lower() == 'multilinestring':
+    #                     for l_ in l.geoms:
+    #                         lines_.append(l_)
+    #                 else:
+    #                     lines_.append(l)
+    #
+    #             return MultiLineString(lines_)
+    #
+    #     else:
+    #         interiors = g.interiors
+    #
+    #         if len(interiors) > 1:
+    #
+    #             idx_max = np.array([x.length for x in interiors]).argmax()
+    #             ring = interiors[int(idx_max)]
+    #
+    #             return LineString(ring)
+    #         else:
+    #             return g.boundary
 
-            if len(interiors) > 1:
-
-                idx_max = np.array([x.length for x in interiors]).argmax()
-                ring = interiors[int(idx_max)]
-
-                return LineString(ring)
-            else:
-                return g.geoms[idx_max].boundary
+    def smooth(l):
+        if l.geom_type.lower() == 'multilinestring':
+            return MultiLineString([taubin_smooth(l_) for l_ in l.geoms])
         else:
-            interiors = g.interiors
+            return taubin_smooth(l)
 
-            if len(interiors) > 1:
-
-                idx_max = np.array([x.length for x in interiors]).argmax()
-                ring = interiors[int(idx_max)]
-
-                return LineString(ring)
-            else:
-                return g.boundary
-
-    contours.geometry = contours.geometry.apply(get_correct_ring)
+    contours_ = contours.copy()
+    contours.geometry = contours.geometry.apply(extract_exteriors)
 
     # Smooth the contours
-    contours.geometry = contours.geometry.apply(lambda x: taubin_smooth(x))
+    contours.geometry = contours.geometry.apply(lambda x: smooth(x))
 
-    # Reset index and colorize
-    contours.reset_index(inplace=True)
+    # Colorize
     contours = add_color_to_df(contours, 'contour', colormap)
 
-    return contours.to_crs(4326)
+    return contours.to_crs(4326), contours_
+
+
+def prepare_buffer_layer(buffer):
+    return pdk.Layer(
+        type="GeoJsonLayer",
+        data=buffer,
+        get_fill_color=PALETTE['red'] + [25],
+        get_line_color=PALETTE['red'] + [200],
+        line_width_max_pixels=1,
+        stroked=True,
+        filled=True,
+    )
+
+
+def prepare_source_layer(source):
+    return pdk.Layer(
+        type="GeoJsonLayer",
+        data=source,
+        get_radius=6,
+        get_fill_color=PALETTE['yellow'] + [200],
+        get_line_color=PALETTE['white'] + [100],
+        line_width_max_pixels=3,
+        stroked=True,
+        pickable=True,
+        auto_highlight=True,
+    )
+
+
+def prepare_start_point_layer(start_point):
+    return pdk.Layer(
+        type="GeoJsonLayer",
+        data=start_point,
+        get_radius=6,
+        get_fill_color=(255, 137, 93, 255),
+        get_line_color=PALETTE['white'] + [100],
+        line_width_max_pixels=3,
+        stroked=True,
+        pickable=True,
+        auto_highlight=True,
+        # tooltip=True
+    )
+
+
+def prepare_edges_layer(edges):
+    return pdk.Layer(
+        type="GeoJsonLayer",
+        data=edges,
+        get_line_color=[255, 255, 255],
+        line_width_min_pixels=1,
+        stroked=True,
+        filled=True,
+        pickable=True,
+        auto_highlight=True,
+        # tooltip=True
+    )
+
+
+def prepare_acc_edges_layer(acc_edges):
+    return pdk.Layer(
+        type="GeoJsonLayer",
+        data=acc_edges,
+        get_line_color=[255, 75, 75],
+        line_width_min_pixels=2,
+        stroked=True,
+        filled=True,
+        pickable=True,
+        auto_highlight=True,
+        # tooltip=True
+    )
+
+
+def prepare_nodes_layer(nodes):
+    return pdk.Layer(
+        type="GeoJsonLayer",
+        data=nodes,
+        get_radius=3,
+        # get_fill_color=[255, 75, 75],
+        get_fill_color=[255, 255, 255],
+        get_line_color=[255, 255, 255, 100],
+        line_width_max_pixels=3,
+        stroked=True,
+        # filled=True,
+        pickable=True,
+        auto_highlight=True,
+        # tooltip=True
+    )
+
+
+def prepare_acc_nodes_layer(acc_nodes):
+    return pdk.Layer(
+        type="GeoJsonLayer",
+        data=acc_nodes,
+        get_radius=3,
+        get_fill_color=[255, 75, 75],
+        # get_fill_color=[255, 255, 255],
+        get_line_color=[255, 255, 255, 100],
+        line_width_max_pixels=3,
+        stroked=True,
+        # filled=True,
+        pickable=True,
+        auto_highlight=True,
+        # tooltip=True
+    )
