@@ -39,19 +39,6 @@ PALETTE = {
 }
 
 
-def distance_between_line_and_point(line, point, interval: int = 10):
-    """
-    Calculate the ~shortest distance between a line and a point. Geometries must be planar/projected.
-    :param line: LineString geometry
-    :param point: Point geometry
-    :param interval: Interval in meters to split the line
-    :return: Distance in meters
-    """
-
-    cut_dists = np.arange(0, line.length, interval)
-    cut_points = MultiPoint([line.interpolate(cut_dist) for cut_dist in cut_dists] + [line.boundary[1]])
-
-
 def get_gdf_corners(gdf):
     xmin, ymin, xmax, ymax = gdf.envelope.total_bounds
     corners = [
