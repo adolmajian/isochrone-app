@@ -26,7 +26,9 @@ from utils import PALETTE
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=ShapelyDeprecationWarning)
 
-st.set_page_config(layout="wide", page_title='Interactive Isochrone Calculator', page_icon=":world_map:")
+st.set_page_config(layout="wide", page_title='Interactive Isochrone Calculator',
+                   description='A web app to calculate isochrones for anywhere in the world using a variety of methods. ',
+                   page_icon=":world_map:")
 
 st.markdown(
     """
@@ -650,6 +652,6 @@ with tab2:
         The app attempts to calculate the extended ego graph first, but in some cases, OSM can have geometries that might not be interpreted correctly by Shapely and cause errors. When this happens, the app defaults to the standard ego graph.
         To keep things simple, the cost of entry to the network is not considered nor is the user chosen location merged to the network. Instead, the neareast node to the chosen location is used as the starting point of the isochrone but [GeoNetworkX](https://geonetworkx.readthedocs.io/en/latest/) is a package that provides utility functions to accomplish just that and I might add it in the future.
         
-        More info and :star: at [github.com/adolmajian/isochrone-app](https://github.com/adolmajian/isochrone-app)
+        GitHub repo and :star: at [github.com/adolmajian/isochrone-app](https://github.com/adolmajian/isochrone-app)
         """, unsafe_allow_html=True
     )
