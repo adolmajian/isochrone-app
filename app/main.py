@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=ShapelyDeprecationWarning)
 
 st.set_page_config(layout="wide", page_title='Interactive Isochrone Calculator',
-                   description='A web app to calculate isochrones for anywhere in the world using a variety of methods. ',
+                   # description='A web app to calculate isochrones for anywhere in the world using a variety of methods. ',
                    page_icon=":world_map:")
 
 st.markdown(
