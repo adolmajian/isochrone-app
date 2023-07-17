@@ -1,4 +1,7 @@
 import base64
+import warnings
+
+warnings.filterwarnings(action='ignore')
 
 import numpy as np
 import pandas as pd
@@ -12,6 +15,7 @@ from io import BytesIO
 from shapely.geometry import shape, MultiPoint, MultiPolygon, Polygon, LineString, MultiLineString
 from shapelysmooth import taubin_smooth
 from scipy.spatial.distance import cdist
+from scipy.spatial import Delaunay
 from scipy.interpolate import LinearNDInterpolator
 
 import rasterio
@@ -49,6 +53,28 @@ def get_gdf_corners(gdf):
     ]
 
     return corners
+
+
+def triangulation_from_points(df):
+    # Check gdf crs
+    if df.crs.to_epsg() == 4326:
+        utm_crs = df.estimate_utm_crs()
+        df = df.to_crs(utm_crs)
+
+    # Get points from gdf
+    pts = list(df.geometry.apply(lambda p: (p.x, p.y)))
+
+    # Compute Delaunay
+    tri = Delaunay(pts)
+
+    # Construct triangles (LineStrings)
+    points = tri.points
+    triangles = []
+    for simplex in tri.simplices:
+        vertices = [points[x] for x in simplex]
+        triangles.append(LineString(vertices))
+
+    return MultiLineString(triangles)
 
 
 def plug_shape_holes(geom):
@@ -172,7 +198,7 @@ def grid_interpolate(node_vals, ref_gdf, target_resolution, algo, p=3, clip_df=T
             img_masked, transform = mask(src, shapes, crop=True, filled=False)
 
     if clip_df:
-        return img_masked, src
+        return img_masked, src, transform
     else:
         return img, src
 
@@ -241,49 +267,6 @@ def extract_contours_from_singleband_raster(img, ref_ds, distance, interval, col
     contours = contours[contours.contour.isin(levels)].sort_values('contour').reset_index(drop=True)
     contours = contours.dissolve('contour')
     contours.reset_index(inplace=True)
-
-    # Get correct ring
-    # def get_correct_ring(row):
-    #     g = row.geometry
-    #     cval = row.contour
-    #
-    #     def extract_largest_ring(p):
-    #         interiors = p.interiors
-    #         if len(interiors) > 1:
-    #             idx_max = np.array([x.length for x in interiors]).argmax()
-    #             ring = interiors[int(idx_max)]
-    #
-    #             return LineString(ring)
-    #         else:
-    #             return p.boundary
-    #
-    #     if g.geom_type.lower() == 'multipolygon':
-    #         idx_max = np.array([x.area for x in g.geoms]).argmax()
-    #         if cval != distance:
-    #             return extract_largest_ring(g.geoms[idx_max])
-    #         else:
-    #             lines = [extract_largest_ring(g_) for g_ in g.geoms]
-    #             lines_ = []
-    #             for l in lines:
-    #                 if l.geom_type.lower() == 'multilinestring':
-    #                     for l_ in l.geoms:
-    #                         lines_.append(l_)
-    #                 else:
-    #                     lines_.append(l)
-    #
-    #             return MultiLineString(lines_)
-    #
-    #     else:
-    #         interiors = g.interiors
-    #
-    #         if len(interiors) > 1:
-    #
-    #             idx_max = np.array([x.length for x in interiors]).argmax()
-    #             ring = interiors[int(idx_max)]
-    #
-    #             return LineString(ring)
-    #         else:
-    #             return g.boundary
 
     def smooth(l):
         if l.geom_type.lower() == 'multilinestring':

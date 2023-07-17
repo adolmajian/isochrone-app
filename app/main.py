@@ -11,6 +11,7 @@ import pydeck as pdk
 import matplotlib.pyplot as plt
 
 from geonetworkx.tools import get_alpha_shape_polygon
+import geonetworkx as gnx
 
 from streamlit_folium import st_folium
 from shapely.geometry import Point, Polygon, MultiPolygon
@@ -85,6 +86,7 @@ interpolation_algo_dict = {
     'idw': 'Inverse Distance Weighting (IDW)',
     'tin': 'Triangular Irregular Network (TIN)'
 }
+is_extended_graph = True
 
 # State variables
 if 'center' not in st.session_state:
@@ -105,7 +107,7 @@ m = folium.Map(location=center, zoom_start=zoom)
 # Layout
 st.title('Welcome to the Isochrone calculator app!')
 
-tab1, tab2, tab3 = st.tabs(["Isochrone Calculator", "About Accessibility", "How to Use the App"])
+tab1, tab2 = st.tabs(["Isochrone Calculator", "How to Use the App"])
 
 # Sidebar Controls
 with st.sidebar:
@@ -169,30 +171,36 @@ with st.sidebar:
     alpha = st.slider('Select the alpha percentile', 0, 100, 85, 1,
                       help='Applies to the concave hull creation. Will keep "percentile" percent of triangles')
     plug_holes_concave = st.checkbox('Fill in holes', value=False,
-                                     help='If the resulting shape contains holes, it will plug/remove them. Applies to concave shape.')
+                                     help='If the resulting shape contains holes, it will plug/remove them. Applies to '
+                                          'concave shape.')
     force_single = st.checkbox('Force single part shape', value=False,
                                help='If the resulting shape is not a single polygon, it will modify the alpha shape '
                                     'parameter until it becomes a single shape. Will override the alpha percentile '
                                     'parameter.')
+    force_links = st.checkbox('Must contain all edges', value=False,
+                              help='Will ensure that all accessible (red) links are within the resulting shape. '
+                                   'Will override the alpha percentile '
+                                   'parameter.')
     new_alpha = None
 
     st.markdown('#### Link Offset Shape')
     offset = st.slider('Select an offset distance (m)', 5, 100, 25, 5,
-                       help='Applies to both link offset and node buffers')
+                       help='Applies to link offset')
     cap_style = st.radio(
-        "Buffer cap style",
+        "Buffer endcap style",
         ["round", "square", "flat"],
         key="cap_style",
         horizontal=True,
     )
-    clip_to_buffer = st.checkbox('Clip shape to buffer', value=False,
-                                 help='With the offset method, the resulting shape can overflow the cicular buffer. '
+    clip_to_buffer = st.checkbox('Clip shape to theoretical accessibility area', value=False,
+                                 help='With the offset method, the resulting shape can overflow the circular buffer. '
                                       'Checking the box will remove the excess.')
     plug_holes_offset = st.checkbox('Fill in holes', value=False,
-                                    help='If the resulting shape contains holes, it will plug/remove them. Applies to offset shape.')
+                                    help='If the resulting shape contains holes, it will plug/remove them. '
+                                         'Applies to link offset.')
 
     st.markdown('#### Grid interpolation')
-    cell_size = st.slider('Select a resolution for the interpolation (m)', 5, 20, 10, 5)
+    cell_size = st.slider('Select a resolution (cell size) for the interpolation (m)', 5, 20, 10, 5)
     algo = st.radio(
         "Interpolation algorithm",
         options=list(interpolation_algo_dict.keys()),
@@ -211,7 +219,9 @@ with tab1:
     except Exception as e:
         print(e)
         with st.empty():
-            st.subheader(':warning: Was unable to either download OSM data for the chosen location or to construct a suitable network. Make sure to choose an area that has a street network.')
+            st.subheader(
+                ':warning: Was unable to either download OSM data for the chosen location or to construct a suitable '
+                'network. Make sure to choose an area that has a street network.')
 
     # Get UTM crs for distance based geoprocessing
     utm_crs = nodes.estimate_utm_crs()
@@ -239,8 +249,21 @@ with tab1:
     start_point = nodes[nodes.index == start_node].copy()
 
     # Calculate isochrone
-    subgraph = nx.ego_graph(graph, start_node, radius=distance, distance='length')
-    acc_nodes, acc_edges = ox.utils_graph.graph_to_gdfs(subgraph)
+    try:
+        # Extended ego graph
+        geo_graph = gnx.GeoGraph(crs=4326)
+        geo_graph.add_edges_from_gdf(edges.reset_index(), edge_first_node_attr='u', edge_second_node_attr='v')
+        geo_graph.add_nodes_from_gdf(nodes.reset_index(), node_index_attr='osmid')
+
+        subgraph = gnx.extended_ego_graph(geo_graph, start_node, 500, distance='length')
+        acc_nodes = subgraph.nodes_to_gdf()
+        acc_edges = subgraph.edges_to_gdf()
+    except Exception as e:
+        print(e)
+        # Simple ego graph
+        is_extended_graph = False
+        subgraph = nx.ego_graph(graph, start_node, radius=distance, distance='length')
+        acc_nodes, acc_edges = ox.utils_graph.graph_to_gdfs(subgraph)
 
     # Convex shape
     shape_convex = acc_nodes.unary_union.convex_hull.buffer(padding_geo)
@@ -253,27 +276,43 @@ with tab1:
 
     # Concave shape - CONDITION - no holes
     if plug_holes_concave:
-        shape_concave = plug_shape_holes(shape_concave)
+        shape_concave = plug_shape_holes(shape_concave).buffer(padding)
 
     # Concave shape - CONDITION - single part geometry
-    if force_single:
-        new_alpha = alpha
-        while shape_concave.geom_type.lower() == 'multipolygon':
+    if force_single or force_links:
+        # Check multi
+        is_multi = shape_concave.geom_type.lower() == 'multipolygon'
+
+        # Check containment
+        is_contained = True  # This is to save time but makes for complicated code. hmm...
+        if force_links:
+            links_dissolved = acc_edges.to_crs(utm_crs).dissolve().geometry.iloc[0]
+            is_contained = shape_concave.contains(links_dissolved)
+
+        if is_multi or not is_contained:
+            new_alpha = alpha
+
+        while is_multi or not is_contained:
             if new_alpha == 100:
                 break
             new_alpha += 1
 
-            shape_concave = get_alpha_shape_polygon(pts, new_alpha)
+            shape_concave = get_alpha_shape_polygon(pts, new_alpha).buffer(padding)
+            is_multi = shape_concave.geom_type.lower() == 'multipolygon'
+
+            if force_links:
+                is_contained = shape_concave.contains(links_dissolved)
+
             if plug_holes_concave:
                 shape_concave = plug_shape_holes(shape_concave)
 
-    shape_concave = shape_concave.buffer(padding)
+    # shape_concave = shape_concave.buffer(padding)
     shape_concave_area = round(shape_concave.area / 1000000, 2)
     shape_concave_df = gpd.GeoDataFrame(geometry=[shape_concave], crs=utm_crs).to_crs(
         'epsg:4326')
 
     # Offset shape
-    shape_offset = acc_edges.to_crs(utm_crs).buffer(offset, cap_style=cap_style).unary_union
+    shape_offset = acc_edges.to_crs(utm_crs).buffer(offset, join_style='round', cap_style=cap_style).unary_union
 
     # Offset shape - CONDITION - no holes
     if plug_holes_offset:
@@ -292,9 +331,9 @@ with tab1:
 
     # Perform the interpolation
     if algo == 'idw':
-        img_singleband, ds = grid_interpolate(node_dists, buffer.to_crs(utm_crs), cell_size, algo='idw')
+        img_singleband, ds, transform = grid_interpolate(node_dists, buffer.to_crs(utm_crs), cell_size, algo='idw')
     if algo == 'tin':
-        img_singleband, ds = grid_interpolate(node_dists, buffer.to_crs(utm_crs), cell_size, algo='tin')
+        img_singleband, ds, transform = grid_interpolate(node_dists, buffer.to_crs(utm_crs), cell_size, algo='tin')
 
     # Colorize and get RGBA uint8 image
     img_rgba = colorize_image(img_singleband, colormap=colormap)
@@ -378,7 +417,7 @@ with tab1:
 
             with inner_col2:
                 # Buffer + Concave
-                st.markdown(f'### Buffer vs concave Shape')
+                st.markdown(f'### Buffer vs Concave Shape')
                 st.pydeck_chart(pdk.Deck(
                     initial_view_state=viewport,
                     layers=[
@@ -545,6 +584,7 @@ with tab1:
                         <span style="padding-left: 5px;">Accessible links</span>
                     </span>
                     """, unsafe_allow_html=True)
+        st.write('Is extended ego graph:', is_extended_graph)
 
         st.markdown('#### Contours')
         st.markdown(f"""
@@ -577,50 +617,40 @@ with tab1:
 
 # Explanations
 with tab2:
-    st.header("About Accessibility")
-
-    st.markdown("""
-      A common concept in Transportation and Urban Planning is the concept of Accessibility (not to be confused with Universal Accessibility); how accessible are amenities or services to a reference(s) point(s). For example, 
-      - What percentage of households are within a 5 minute drive to a pharmacy?
-      - A Transportation Master Plan objective aims to have 100% of households within 500 m distance walk from a bus stop by redesigning their bus network in the next 2 years.
-      - How many people live 20 minutes, 30 minutes, 45 minutes, 1 hour, and more than an hour away from the university by cycling or public transportation.
-
-      These questions often translate to Accessibility or Reach Map analyses that aim to create a single or a series of `isochrones` (lines/areas or equal travel time) or `isodistances` (lines/areas of equal distance); similar to contour lines on topo maps (lines of equal elevation). An aspect of reach maps that it often overlooked is how the accesibility surface is actually computed or constructed. The final result is a polygon but the underlying calculations to determine the accessible area(s) are graph/network calculations (commonly ego graph or ego network) that yield a subset of nodes (intersections) and links (roads) that are within the required distance or travel time. An additional step is needed to transform or approximate a shape (line or polygon) from those nodes and links. The correct choice of methodology or algorithm to approximate a shape can depend on the:
-      - Use case
-      - Location and network characteristics (urban vs rural areas, link and node density, connectivity, circuity, etc.)
-      
-      There are two main families of methodologies to approximate accessibility polygons:
-       - Computational Geometry methods (vector calculations)
-       - Spatial/Grid interpolation methods (raster calculations)
-       
-       The objective of this Streamlit app is to allow the user to experiment with the different methodologies and hopefully garner a better understanding about which method to use when and why. The app allows the user to apply the following methods to approximate the accessibility polygon.
-       
-       ### Vector methods
-       - Convex hull
-       - Concave hull or alpha shape
-       - Link offset
-       
-       ### Raster methods
-       - Grid interpolation
-            - Inverse Distance Weighting (IDW)
-            - Triangular Irregular Network / Linear interpolation
-       - Extraction of contour lines from the interpolation surface
-       """
-                )
-
-    with tab3:
-        st.header('How to use the app')
-
-        st.markdown(
-            """
-            The app is controlled with the sidebar and the results are shown on the right.
-            There are two main controls.
-            ### Location controls
-            Pan the map and position your desired location under the crosshair <span style="color: rgb(255, 75, 75);">⌖</span>. Once you have your location, click the `Set location` button to launch the calculation. *Panning the map will not automatically relaunch the calculation, only clicking the button will.*
-            ### Shape approximation controls
-            For each method and algorithm, the user can tweak the settings and see the results in realtime. *Everytime a setting is changed, all of the calculations are relaunched.*
-            ### Packages used and limitations
-            The app works by downloading the walking network from OpenStreetMap using the osmnx package which in turn uses nx package for network calculations. Shapely, Geopandas, and SciPy are used for geospatial and interpolation calculations and rasterio is used to transform the raster space into a geospatial one. To keep things simple, the cost of entry to the network is not considered nor is the user chosen location merged to the network, instead the neareast node to the chosen location is used as the starting point of the isochrone (but geonetworkx is a package that provides utility functions to accomplish just that).
-            
-            """, unsafe_allow_html=True
-        )
+    st.markdown(
+        """
+        ## About Accessibility and Isochrones
+        
+        This app creates walking distance `isochrones` for anywhere in the world that is already mapped in OpenStreetMap. Isochrones are lines of equal travel time or distance, an Accessibility concept used in Transportaiton and Urban Planning. The objective of the app is to allow the user to play with common algorithms and methodologies used in creating isochrones, to tweak their parameters and see how the result is affected. The isochrone calculation methods available in the app are:
+        
+        #### Computational Geometry methods (vector)
+        - Convex Hull
+        - Concave Hull
+        - Link Offset
+        
+        #### Grid/Spatial Interpolation methods (raster)
+        - Inverse Distance Weighting (IDW)
+        - Triangular Irregular Network (TIN) / Linear
+        
+        In every case, the result is compared to the theoretical accessibility surface which is just a  buffer of `x` meters applied to the source where `x` is the maximum target distance. If you are unfamiliar with the the concept of isochrones or want more information, I have written a full tutorial article here.
+        
+        ## Controls
+        
+        The app is controlled with the sidebar and the results are shown on the right. Each map can be viewed full-screen by clicking the toggle <span style="margin: 0 7px 0 7px; padding: 5px; background-color: #34282C;"><svg viewBox="0 0 8 8" aria-hidden="true" focusable="false" fill="currentColor" xmlns="http://www.w3.org/2000/svg" color="inherit" class="e1fb0mya1 css-1pxazr7 ex0cdmw0"><path d="M0 0v4l1.5-1.5L3 4l1-1-1.5-1.5L4 0H0zm5 4L4 5l1.5 1.5L4 8h4V4L6.5 5.5 5 4z"></path></svg></span> to the top-right of a given map. The legend shows detailed information about the layers and the areas of each shape for easy comparison.
+        There are two main controls.
+        ### Location Controls
+        Pan the map and position your desired location under the crosshair <span style="color: rgb(255, 75, 75); margin: 0 7px 0 7px;">⌖</span>. Once you have your location, click the `Set location` button to launch the calculation. *Panning the map will not automatically relaunch the calculation, only clicking the button will* (which is a good thing - thank you Streamlit forms!).
+        ### Shape Approximation Controls
+        For each method and algorithm, the user can tweak the settings and see the results in realtime. *Everytime a setting is changed, all of the calculations are relaunched.*
+        
+        ## Packages Used and Limitations
+        
+        The app works by downloading the walking network from [OpenStreetMap](https://www.openstreetmap.org/) using the [OSMnx](https://osmnx.readthedocs.io/en/stable/) package which in turn uses the [NetworkX](https://networkx.org/documentation/stable/index.html) and [GeoNetworkX](https://geonetworkx.readthedocs.io/en/latest/) packages for network calculations. Geospatial data manipulation is done using [GeoPandas](https://geopandas.org/en/stable/) and [Rasterio](https://rasterio.readthedocs.io/en/stable/) (for vector and raster data respectively) and [Pillow](https://pillow.readthedocs.io/en/stable/) is used for image format manipulation. [SciPy](https://scipy.org/) is used for the spatial/grid interpolation (to avoid using GDAL which would have been easier but installing GDAL is really a hit or miss each time, and I wanted to keep the package management simple for the sake of hosting on Streamlit). User interaction and visualization on web maps are achieved using [Folium](https://python-visualization.github.io/folium/) and [PyDeck](https://deckgl.readthedocs.io/en/latest/).
+        
+        The app attempts to calculate the extended ego graph first, but in some cases, OSM can have geometries that might not be interpreted correctly by Shapely and cause errors. When this happens, the app defaults to the standard ego graph.
+        To keep things simple, the cost of entry to the network is not considered nor is the user chosen location merged to the network. Instead, the neareast node to the chosen location is used as the starting point of the isochrone but [GeoNetworkX](https://geonetworkx.readthedocs.io/en/latest/) is a package that provides utility functions to accomplish just that and I might add it in the future.
+        
+        st.markdown("More infos and :star: at [github.com/adolmajian/isochrone-app](https://github.com/adolmajian/isochrone-app)"
+)
+        """, unsafe_allow_html=True
+    )
