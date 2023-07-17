@@ -112,11 +112,6 @@ def prepare_interpolation_points(subgraph, start_node, acc_nodes, colormap):
 
     # Add color columns
     node_dists = add_color_to_df(node_dists, 'dist', colormap)
-    # normalized_values = (node_dists['dist'] - node_dists['dist'].min()) / (
-    #         node_dists['dist'].max() - node_dists['dist'].min())
-    # node_dists['color_hex'] = normalized_values.apply(lambda x: mcolors.to_hex(colormap(x)))
-    # node_dists['color_rgb'] = normalized_values.apply(
-    #     lambda x: eval(str(list((np.array(mcolors.to_rgb(colormap(x))) * 255).astype(np.uint8)))))
 
     return node_dists
 
