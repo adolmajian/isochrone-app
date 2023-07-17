@@ -632,7 +632,7 @@ with tab2:
         - Inverse Distance Weighting (IDW)
         - Triangular Irregular Network (TIN) / Linear
         
-        In every case, the result is compared to the theoretical accessibility surface which is just a  buffer of `x` meters applied to the source where `x` is the maximum target distance. If you are unfamiliar with the the concept of isochrones or want more information, I have written a full tutorial article here.
+        In every case, the result is compared to the theoretical accessibility surface which is just a  buffer of `x` meters applied to the source where `x` is the maximum target distance. If you are unfamiliar with the the concept of isochrones or want more information, I have written a [full tutorial article here](https://medium.com/@arthur.dolmajian/creating-isochrones-what-is-the-optimal-way-dfc77a2ca13a).
         
         ## Controls
         
