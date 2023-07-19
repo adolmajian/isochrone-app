@@ -257,7 +257,7 @@ with tab1:
         geo_graph.add_edges_from_gdf(edges.reset_index(), edge_first_node_attr='u', edge_second_node_attr='v')
         geo_graph.add_nodes_from_gdf(nodes.reset_index(), node_index_attr='osmid')
 
-        subgraph = gnx.extended_ego_graph(geo_graph, start_node, 500, distance='length')
+        subgraph = gnx.extended_ego_graph(geo_graph, start_node, distance, distance='length')
         acc_nodes = subgraph.nodes_to_gdf()
         acc_edges = subgraph.edges_to_gdf()
     except Exception as e:
