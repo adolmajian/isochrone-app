@@ -82,8 +82,7 @@ center = [45.503032, -73.566424]
 zoom = 15
 use_time = False
 colormap = plt.cm.YlOrRd
-padding_geo = 1 / 111111 * 10
-padding = 10
+padding_geo_factor = 1 / 111111
 interpolation_algo_dict = {
     'idw': 'Inverse Distance Weighting (IDW)',
     'tin': 'Triangular Irregular Network (TIN)'
@@ -170,8 +169,10 @@ with st.sidebar:
     st.markdown('## Shape Approximation Controls')
 
     st.markdown('#### Concave Shape')
-    alpha = st.slider('Select the alpha percentile', 0, 100, 85, 1,
+    alpha = st.slider('Select the alpha percentile', 0, 100, 90, 1,
                       help='Applies to the concave hull creation. Will keep "percentile" percent of triangles')
+    padding = st.slider('Extra padding around shape (m)', 10, 25, 10, 1,
+                        help='Applies extra padding(buffer) to convex and concave shapes to avoid bad geometries')
     plug_holes_concave = st.checkbox('Fill in holes', value=False,
                                      help='If the resulting shape contains holes, it will plug/remove them. Applies to '
                                           'concave shape.')
@@ -202,7 +203,7 @@ with st.sidebar:
                                          'Applies to link offset.')
 
     st.markdown('#### Grid interpolation')
-    cell_size = st.slider('Select a resolution (cell size) for the interpolation (m)', 5, 20, 10, 5)
+    cell_size = st.slider('Select a resolution (cell size) for the interpolation (m)', 5, 30, 10, 5)
     algo = st.radio(
         "Interpolation algorithm",
         options=list(interpolation_algo_dict.keys()),
@@ -268,6 +269,7 @@ with tab1:
         acc_nodes, acc_edges = ox.utils_graph.graph_to_gdfs(subgraph)
 
     # Convex shape
+    padding_geo = padding * padding_geo_factor
     shape_convex = acc_nodes.unary_union.convex_hull.buffer(padding_geo)
     shape_convex_df = gpd.GeoDataFrame(geometry=[shape_convex], crs='epsg:4326')
     shape_convex_area = round(shape_convex_df.to_crs(utm_crs).iloc[0].geometry.area / 1000000, 2)
